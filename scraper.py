@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Starlight Caregivers / ClearCare family-room daily dashboard scraper.
+Starlight Caregivers / ClearCare family-room care-log scraper.
 
-Logs in, captures the dashboard contents, and emails a digest to the configured
-recipients. Designed to run as a GitHub Actions cron job, but works fine locally
-too — just set the env vars below.
+Logs in, extracts care log entries posted since the last successful run,
+and emails a structured digest to the configured recipients.
 
 Required env vars:
     PORTAL_EMAIL          login email for the family room
@@ -14,42 +13,50 @@ Required env vars:
     EMAIL_TO              comma-separated recipient list
 
 Optional env vars:
-    SKIP_JITTER=1         skip the random pre-run sleep (useful for local testing)
+    SINCE                 ISO-8601 timestamp — only include entries after this
+                          (defaults to 24 hours ago)
+    SKIP_JITTER=1         skip the random pre-run sleep
 """
 from __future__ import annotations
 
+import html as html_mod
 import os
-import random
+import re
 import smtplib
 import ssl
 import sys
-import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-
 PORTAL_URL = "https://starlightcaregivers.clearcareonline.com/family-room/login/"
+BASE_URL = PORTAL_URL.rsplit("/login/", 1)[0]
 ARTIFACTS_DIR = Path("artifacts")
 ARTIFACTS_DIR.mkdir(exist_ok=True)
 
+_shot = 0
+
 
 def log(msg: str) -> None:
-    print(f"[{datetime.utcnow().isoformat(timespec='seconds')}Z] {msg}", flush=True)
+    print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] {msg}", flush=True)
 
 
-def jitter_sleep(max_seconds: int = 3600) -> None:
-    """Sleep a random 0–max_seconds so the job doesn't run at a predictable minute."""
-    if os.environ.get("SKIP_JITTER") == "1":
-        log("SKIP_JITTER set, skipping pre-run sleep")
-        return
-    delay = random.randint(0, max_seconds)
-    log(f"Sleeping {delay}s before run")
-    time.sleep(delay)
+def screenshot(page, name: str) -> None:
+    global _shot
+    _shot += 1
+    path = ARTIFACTS_DIR / f"{_shot:02d}-{name}.png"
+    page.screenshot(path=str(path), full_page=True)
+    log(f"Screenshot: {path}")
+
+
+def dump_html(page, name: str) -> None:
+    path = ARTIFACTS_DIR / f"{name}.html"
+    path.write_text(page.content())
+    log(f"HTML dump: {path}")
 
 
 def require_env(name: str) -> str:
@@ -59,8 +66,117 @@ def require_env(name: str) -> str:
     return value
 
 
-def scrape_dashboard(email: str, password: str) -> tuple[str, str]:
-    """Returns (plain_text, html) of the dashboard. Raises on failure."""
+def parse_since() -> datetime:
+    raw = os.environ.get("SINCE", "")
+    if raw:
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            log(f"Could not parse SINCE={raw!r}, defaulting to 24h ago")
+    return datetime.now(timezone.utc) - timedelta(hours=24)
+
+
+# ---------------------------------------------------------------------------
+# Scraping
+# ---------------------------------------------------------------------------
+
+def do_login(page, email: str, password: str) -> None:
+    log(f"Navigating to {PORTAL_URL}")
+    page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=30_000)
+    page.get_by_role("textbox", name="E-mail").fill(email)
+    page.get_by_role("textbox", name="Password").fill(password)
+    page.get_by_role("button", name="Login").click()
+    page.wait_for_selector("#contentWrap", timeout=30_000)
+    page.wait_for_load_state("networkidle", timeout=30_000)
+    log(f"Logged in — {page.url}")
+    screenshot(page, "after-login")
+
+
+def log_page_links(page) -> None:
+    links = page.query_selector_all("a")
+    log(f"{len(links)} links on page:")
+    for link in links:
+        try:
+            href = link.get_attribute("href") or ""
+            text = (link.inner_text() or "").strip().replace("\n", " ")
+            if text and len(text) < 120:
+                log(f"  [{text}] -> {href}")
+        except Exception:
+            pass
+
+
+def navigate_to_care_logs(page) -> None:
+    log_page_links(page)
+
+    for pattern in [r"care\s*log", r"daily\s*log", r"daily", r"log", r"note"]:
+        try:
+            link = page.get_by_role("link", name=re.compile(pattern, re.I)).first
+            link.click()
+            page.wait_for_load_state("networkidle", timeout=15_000)
+            log(f"Clicked link matching /{pattern}/. URL: {page.url}")
+            screenshot(page, "care-logs")
+            dump_html(page, "care-logs")
+            return
+        except Exception:
+            continue
+
+    for path in ("/care-log/", "/care-logs/", "/daily-log/", "/logs/"):
+        try:
+            page.goto(BASE_URL + path, wait_until="domcontentloaded", timeout=15_000)
+            page.wait_for_load_state("networkidle", timeout=10_000)
+            if "/login" not in page.url:
+                log(f"Direct nav to {path} worked. URL: {page.url}")
+                screenshot(page, "care-logs")
+                dump_html(page, "care-logs")
+                return
+        except Exception:
+            continue
+
+    log("Could not find a care-log page; will parse the dashboard instead.")
+    screenshot(page, "care-logs-fallback")
+    dump_html(page, "care-logs-fallback")
+
+
+def parse_entries(page, since: datetime) -> list[dict]:
+    """Try to extract structured care log entries.
+
+    Returns a list of dicts.  Best case: {name, date, text}.
+    Fallback: {raw}.
+    """
+    entries: list[dict] = []
+
+    # Try common ClearCare selectors for individual entries
+    for sel in (
+        ".log-entry",
+        ".care-log-entry",
+        ".daily-log-entry",
+        ".activity-entry",
+        "[class*='logEntry']",
+        "[class*='careLog']",
+        "[class*='note-entry']",
+        ".entry",
+    ):
+        items = page.query_selector_all(sel)
+        if items:
+            log(f"Matched {len(items)} elements with '{sel}'")
+            for item in items:
+                text = item.inner_text().strip()
+                if text:
+                    entries.append({"raw": text, "_sel": sel})
+            break
+
+    if not entries:
+        log("No structured selectors matched — falling back to #contentWrap text")
+        try:
+            text = page.locator("#contentWrap").inner_text(timeout=5_000)
+        except Exception:
+            text = page.locator("body").inner_text()
+        entries.append({"raw": text, "_sel": "fallback"})
+
+    return entries
+
+
+def scrape_care_logs(email: str, password: str, since: datetime) -> list[dict]:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -71,47 +187,69 @@ def scrape_dashboard(email: str, password: str) -> tuple[str, str]:
             viewport={"width": 1280, "height": 900},
         )
         page = context.new_page()
-
         try:
-            log(f"Navigating to {PORTAL_URL}")
-            page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=30_000)
-
-            # Login form. Selectors captured via `playwright codegen` against the
-            # live portal. If these break, re-run codegen and update.
-            page.get_by_role("textbox", name="E-mail").fill(email)
-            page.get_by_role("textbox", name="Password").fill(password)
-            page.get_by_role("button", name="Login").click()
-
-            # Wait for the dashboard's main content wrapper to appear -- this is
-            # our signal that login succeeded and the page has rendered.
-            page.wait_for_selector("#contentWrap", timeout=30_000)
-            page.wait_for_load_state("networkidle", timeout=30_000)
-            log(f"Logged in. Current URL: {page.url}")
-
-            # Grab the dashboard content.
-            dashboard_html = page.content()
-            try:
-                dashboard_text = page.locator("#contentWrap").inner_text(timeout=5_000)
-            except Exception:
-                dashboard_text = page.locator("body").inner_text()
-
-            page.screenshot(
-                path=str(ARTIFACTS_DIR / "dashboard.png"), full_page=True
-            )
-            log("Captured dashboard text + screenshot")
-            return dashboard_text, dashboard_html
-
+            do_login(page, email, password)
+            navigate_to_care_logs(page)
+            return parse_entries(page, since)
         except Exception:
             try:
-                page.screenshot(
-                    path=str(ARTIFACTS_DIR / "failure.png"), full_page=True
-                )
+                screenshot(page, "failure")
             except Exception:
                 pass
             raise
         finally:
             context.close()
             browser.close()
+
+
+# ---------------------------------------------------------------------------
+# Email
+# ---------------------------------------------------------------------------
+
+def format_text(entries: list[dict], since: datetime) -> str:
+    since_str = since.strftime("%B %d, %Y %I:%M %p UTC")
+    lines = [f"Care log entries since {since_str}", "=" * 50]
+    if not entries:
+        lines.append("\nNo new entries found.")
+    for i, e in enumerate(entries, 1):
+        lines.append(f"\n--- Entry {i} ---")
+        if "name" in e:
+            lines.append(f"Caregiver: {e['name']}")
+        if "date" in e:
+            lines.append(f"Date: {e['date']}")
+        lines.append(e.get("text", e.get("raw", "")))
+        lines.append("")
+    return "\n".join(lines)
+
+
+def format_html(entries: list[dict], since: datetime) -> str:
+    since_str = since.strftime("%B %d, %Y %I:%M %p UTC")
+    h = html_mod.escape
+    parts = [
+        "<html><body style='font-family:sans-serif'>",
+        "<h2>Care Log Entries</h2>",
+        f"<p style='color:#666'>Since {h(since_str)}</p>",
+    ]
+    if not entries:
+        parts.append("<p>No new entries found.</p>")
+    for e in entries:
+        parts.append(
+            "<div style='margin-bottom:20px;padding:12px;"
+            "border-left:3px solid #2196F3;background:#f5f5f5'>"
+        )
+        if "name" in e:
+            parts.append(f"<strong>{h(e['name'])}</strong>")
+        if "date" in e:
+            parts.append(f" &mdash; <em>{h(e['date'])}</em>")
+        if "name" in e or "date" in e:
+            parts.append("<br>")
+        text = e.get("text", e.get("raw", ""))
+        parts.append(
+            f"<p style='margin:8px 0 0;white-space:pre-wrap'>{h(text)}</p>"
+        )
+        parts.append("</div>")
+    parts.append("</body></html>")
+    return "\n".join(parts)
 
 
 def send_email(
@@ -125,7 +263,7 @@ def send_email(
 ) -> None:
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = gmail_user
+    msg["From"] = f"Starlight Digest Bot <{gmail_user}>"
     msg["To"] = ", ".join(recipients)
     msg.attach(MIMEText(body_text, "plain"))
     msg.attach(MIMEText(body_html, "html"))
@@ -139,6 +277,10 @@ def send_email(
     log(f"Sent '{subject}' to {recipients}")
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main() -> int:
     portal_email = require_env("PORTAL_EMAIL")
     portal_password = require_env("PORTAL_PASSWORD")
@@ -146,34 +288,35 @@ def main() -> int:
     gmail_app_pw = require_env("GMAIL_APP_PASSWORD")
     recipients = [r.strip() for r in require_env("EMAIL_TO").split(",") if r.strip()]
 
-    jitter_sleep(0)
+    since = parse_since()
+    log(f"Filtering entries since {since.isoformat()}")
 
     today = datetime.now().strftime("%A, %B %d, %Y")
-    subject = f"Starlight Caregivers daily update — {today}"
+    subject = f"Starlight Care Log — {today}"
 
     try:
-        text, html = scrape_dashboard(portal_email, portal_password)
-    except Exception as e:
+        entries = scrape_care_logs(portal_email, portal_password, since)
+    except Exception as exc:
         err = (
-            f"The Starlight daily scrape failed.\n\n"
-            f"{type(e).__name__}: {e}\n\n"
-            f"Traceback:\n{traceback.format_exc()}"
+            f"Care-log scrape failed.\n\n"
+            f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
         )
         log(err)
         send_email(
             subject=f"[FAILED] {subject}",
             body_text=err,
-            body_html=f"<pre>{err}</pre>",
+            body_html=f"<pre>{html_mod.escape(err)}</pre>",
             gmail_user=gmail_user,
             gmail_app_pw=gmail_app_pw,
             recipients=recipients,
         )
         return 1
 
+    log(f"{len(entries)} entries to send")
     send_email(
         subject=subject,
-        body_text=text,
-        body_html=html,
+        body_text=format_text(entries, since),
+        body_html=format_html(entries, since),
         gmail_user=gmail_user,
         gmail_app_pw=gmail_app_pw,
         recipients=recipients,

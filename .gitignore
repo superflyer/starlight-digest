@@ -1,0 +1,18 @@
+# Python venv (created at project root)
+bin/
+include/
+lib/
+pyvenv.cfg
+__pycache__/
+
+# Playwright artifacts
+artifacts/
+
+# macOS
+.DS_Store
+
+# Codegen scratch files
+login.py
+
+# Claude Code
+.claude/
