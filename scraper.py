@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import html as html_mod
 import os
+import re
 import smtplib
 import ssl
 import sys
@@ -106,46 +107,70 @@ def load_all_updates(page) -> None:
     log(f"Finished loading updates ({clicks} pagination clicks)")
 
 
-def parse_entries(page, since: datetime) -> list[dict]:
-    """Extract update entries from the dashboard.
+def parse_entry_date(raw_date: str) -> datetime | None:
+    """Parse a ClearCare timestamp like 'Sun May 17, 2026' into a datetime."""
+    cleaned = raw_date.replace("CARE LOG,", "").strip()
+    for fmt in ("%a %b %d, %Y", "%b %d, %Y"):
+        try:
+            return datetime.strptime(cleaned, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
 
-    Each update card on the ClearCare dashboard has a caregiver name,
-    date, and log text.  We try several selector strategies, then dump
-    the HTML for offline analysis regardless.
+
+def parse_entries(page, since: datetime) -> list[dict]:
+    """Extract care log entries from the dashboard feed.
+
+    Each entry is an <article class="postWrap"> with:
+      - h3.userName          — posted-by name (usually the agency contact)
+      - span.timeStamp       — date string
+      - p.postMsg.ng-binding — the actual log text (inside the 'message' div)
     """
     dump_html(page, "dashboard")
 
+    articles = page.query_selector_all("article.postWrap")
+    log(f"Found {len(articles)} article.postWrap elements")
+
     entries: list[dict] = []
-
-    # Strategy: look for common container selectors
-    for sel in (
-        ".update-entry",
-        ".activity-update",
-        ".dashboard-update",
-        "[class*='update']",
-        "[class*='Update']",
-        ".feed-item",
-        ".stream-item",
-        "[class*='feed']",
-        "[class*='stream']",
-    ):
-        items = page.query_selector_all(sel)
-        if items:
-            log(f"Matched {len(items)} elements with '{sel}'")
-            for item in items:
-                text = item.inner_text().strip()
-                if text:
-                    entries.append({"raw": text, "_sel": sel})
-            break
-
-    if not entries:
-        log("No structured selectors matched — falling back to #contentWrap text")
+    for article in articles:
         try:
-            text = page.locator("#contentWrap").inner_text(timeout=5_000)
-        except Exception:
-            text = page.locator("body").inner_text()
-        entries.append({"raw": text, "_sel": "fallback"})
+            msg_el = article.query_selector(
+                "div[ng-show*=\"model_type=='message'\"] p.postMsg"
+            )
+            if not msg_el:
+                continue
+            text = msg_el.inner_text().strip()
+            if not text:
+                continue
 
+            name_el = article.query_selector("h3.userName")
+            date_el = article.query_selector("span.timeStamp")
+
+            name = name_el.inner_text().strip() if name_el else ""
+            raw_date = date_el.inner_text().strip() if date_el else ""
+            parsed_date = parse_entry_date(raw_date)
+
+            if parsed_date and parsed_date < since:
+                log(f"  Skipping entry dated {raw_date} (before SINCE)")
+                continue
+
+            # The log text often starts with "5/16, 10am to 4pm, Latu: ..."
+            # Extract the caregiver name from the text itself
+            caregiver = ""
+            m = re.match(r"\d+/\d+,\s*[^,]+,\s*([^:]+):", text)
+            if m:
+                caregiver = m.group(1).strip()
+
+            entries.append({
+                "name": name,
+                "date": raw_date,
+                "caregiver": caregiver,
+                "text": text,
+            })
+        except Exception as exc:
+            log(f"  Error parsing entry: {exc}")
+
+    log(f"Parsed {len(entries)} entries after date filter")
     return entries
 
 
@@ -181,45 +206,49 @@ def scrape_care_logs(email: str, password: str, since: datetime) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def format_text(entries: list[dict], since: datetime) -> str:
-    since_str = since.strftime("%B %d, %Y %I:%M %p UTC")
+    since_str = since.strftime("%B %d, %Y")
     lines = [f"Care log entries since {since_str}", "=" * 50]
     if not entries:
         lines.append("\nNo new entries found.")
-    for i, e in enumerate(entries, 1):
-        lines.append(f"\n--- Entry {i} ---")
-        if "name" in e:
-            lines.append(f"Caregiver: {e['name']}")
-        if "date" in e:
-            lines.append(f"Date: {e['date']}")
-        lines.append(e.get("text", e.get("raw", "")))
+    for e in entries:
+        header = e.get("date", "")
+        if e.get("caregiver"):
+            header += f" — {e['caregiver']}"
+        lines.append(f"\n{header}")
+        lines.append("-" * len(header))
+        lines.append(e["text"])
         lines.append("")
     return "\n".join(lines)
 
 
 def format_html(entries: list[dict], since: datetime) -> str:
-    since_str = since.strftime("%B %d, %Y %I:%M %p UTC")
+    since_str = since.strftime("%B %d, %Y")
     h = html_mod.escape
     parts = [
-        "<html><body style='font-family:sans-serif'>",
-        "<h2>Care Log Entries</h2>",
-        f"<p style='color:#666'>Since {h(since_str)}</p>",
+        "<html><body style='font-family:sans-serif;max-width:600px;margin:auto'>",
+        "<h2 style='color:#333'>Care Log</h2>",
+        f"<p style='color:#888;font-size:14px'>{len(entries)} entries since {h(since_str)}</p>",
     ]
     if not entries:
         parts.append("<p>No new entries found.</p>")
     for e in entries:
+        caregiver = e.get("caregiver", "")
+        date = h(e.get("date", ""))
         parts.append(
-            "<div style='margin-bottom:20px;padding:12px;"
-            "border-left:3px solid #2196F3;background:#f5f5f5'>"
+            "<div style='margin-bottom:24px;padding:12px 16px;"
+            "border-left:4px solid #009688;background:#f9f9f9;"
+            "border-radius:0 4px 4px 0'>"
         )
-        if "name" in e:
-            parts.append(f"<strong>{h(e['name'])}</strong>")
-        if "date" in e:
-            parts.append(f" &mdash; <em>{h(e['date'])}</em>")
-        if "name" in e or "date" in e:
-            parts.append("<br>")
-        text = e.get("text", e.get("raw", ""))
+        parts.append(f"<div style='margin-bottom:8px'>")
+        if caregiver:
+            parts.append(f"<strong style='color:#009688'>{h(caregiver)}</strong>")
+            parts.append(f" &mdash; <span style='color:#666'>{date}</span>")
+        else:
+            parts.append(f"<strong style='color:#666'>{date}</strong>")
+        parts.append("</div>")
         parts.append(
-            f"<p style='margin:8px 0 0;white-space:pre-wrap'>{h(text)}</p>"
+            f"<div style='white-space:pre-wrap;line-height:1.5;font-size:14px'>"
+            f"{h(e['text'])}</div>"
         )
         parts.append("</div>")
     parts.append("</body></html>")
