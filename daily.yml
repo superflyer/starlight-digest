@@ -1,0 +1,45 @@
+name: Daily Starlight digest
+
+on:
+  schedule:
+    # 10:00 UTC = 3:00 AM PDT (most of the year) / 2:00 AM PST (winter).
+    # The script then sleeps a random 0-60 min, so the actual send time lands
+    # somewhere in [3:00, 4:00) AM PDT or [2:00, 3:00) AM PST.
+    - cron: "0 10 * * *"
+  workflow_dispatch: {}   # manual "Run workflow" button in the Actions tab
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90   # generous; jitter sleep can use most of an hour
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      - name: Install Chromium for Playwright
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run scraper
+        env:
+          PORTAL_EMAIL:       ${{ secrets.PORTAL_EMAIL }}
+          PORTAL_PASSWORD:    ${{ secrets.PORTAL_PASSWORD }}
+          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_TO:           ${{ secrets.EMAIL_TO }}
+        run: python scraper.py
+
+      - name: Upload screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
