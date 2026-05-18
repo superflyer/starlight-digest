@@ -146,7 +146,7 @@ def main() -> int:
     gmail_app_pw = require_env("GMAIL_APP_PASSWORD")
     recipients = [r.strip() for r in require_env("EMAIL_TO").split(",") if r.strip()]
 
-    jitter_sleep(3600)
+    jitter_sleep(0)
 
     today = datetime.now().strftime("%A, %B %d, %Y")
     subject = f"Starlight Caregivers daily update — {today}"
