@@ -76,26 +76,22 @@ def scrape_dashboard(email: str, password: str) -> tuple[str, str]:
             log(f"Navigating to {PORTAL_URL}")
             page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=30_000)
 
-            # Login form. If these selectors break, run `playwright codegen` against
-            # the portal locally and update them.
-            page.fill(
-                'input[type="email"], input[name="username"], input[name="email"]',
-                email,
-            )
-            page.fill('input[type="password"], input[name="password"]', password)
-            page.click('button[type="submit"], input[type="submit"]')
+            # Login form. Selectors captured via `playwright codegen` against the
+            # live portal. If these break, re-run codegen and update.
+            page.get_by_role("textbox", name="E-mail").fill(email)
+            page.get_by_role("textbox", name="Password").fill(password)
+            page.get_by_role("button", name="Login").click()
 
-            # Wait until we're off the login page.
-            page.wait_for_url(lambda u: "/login" not in u, timeout=30_000)
+            # Wait for the dashboard's main content wrapper to appear -- this is
+            # our signal that login succeeded and the page has rendered.
+            page.wait_for_selector("#contentWrap", timeout=30_000)
             page.wait_for_load_state("networkidle", timeout=30_000)
             log(f"Logged in. Current URL: {page.url}")
 
-            # Grab the dashboard content. We snapshot main if it exists, else body.
+            # Grab the dashboard content.
             dashboard_html = page.content()
             try:
-                dashboard_text = page.locator("main, #content, body").first.inner_text(
-                    timeout=5_000
-                )
+                dashboard_text = page.locator("#contentWrap").inner_text(timeout=5_000)
             except Exception:
                 dashboard_text = page.locator("body").inner_text()
 
@@ -150,7 +146,7 @@ def main() -> int:
     gmail_app_pw = require_env("GMAIL_APP_PASSWORD")
     recipients = [r.strip() for r in require_env("EMAIL_TO").split(",") if r.strip()]
 
-    jitter_sleep(3600)
+    jitter_sleep(0)
 
     today = datetime.now().strftime("%A, %B %d, %Y")
     subject = f"Starlight Caregivers daily update — {today}"
