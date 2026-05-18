@@ -15,13 +15,11 @@ Required env vars:
 Optional env vars:
     SINCE                 ISO-8601 timestamp — only include entries after this
                           (defaults to 24 hours ago)
-    SKIP_JITTER=1         skip the random pre-run sleep
 """
 from __future__ import annotations
 
 import html as html_mod
 import os
-import re
 import smtplib
 import ssl
 import sys
@@ -34,7 +32,6 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 PORTAL_URL = "https://starlightcaregivers.clearcareonline.com/family-room/login/"
-BASE_URL = PORTAL_URL.rsplit("/login/", 1)[0]
 ARTIFACTS_DIR = Path("artifacts")
 ARTIFACTS_DIR.mkdir(exist_ok=True)
 
@@ -92,69 +89,45 @@ def do_login(page, email: str, password: str) -> None:
     screenshot(page, "after-login")
 
 
-def log_page_links(page) -> None:
-    links = page.query_selector_all("a")
-    log(f"{len(links)} links on page:")
-    for link in links:
+def load_all_updates(page) -> None:
+    """Click 'Load More Updates' until all entries are visible."""
+    clicks = 0
+    while True:
         try:
-            href = link.get_attribute("href") or ""
-            text = (link.inner_text() or "").strip().replace("\n", " ")
-            if text and len(text) < 120:
-                log(f"  [{text}] -> {href}")
-        except Exception:
-            pass
-
-
-def navigate_to_care_logs(page) -> None:
-    log_page_links(page)
-
-    for pattern in [r"care\s*log", r"daily\s*log", r"daily", r"log", r"note"]:
-        try:
-            link = page.get_by_role("link", name=re.compile(pattern, re.I)).first
-            link.click()
+            btn = page.get_by_text("Load More Updates", exact=False)
+            if not btn.is_visible(timeout=2_000):
+                break
+            btn.click()
             page.wait_for_load_state("networkidle", timeout=15_000)
-            log(f"Clicked link matching /{pattern}/. URL: {page.url}")
-            screenshot(page, "care-logs")
-            dump_html(page, "care-logs")
-            return
+            clicks += 1
+            log(f"Clicked 'Load More Updates' ({clicks})")
         except Exception:
-            continue
-
-    for path in ("/care-log/", "/care-logs/", "/daily-log/", "/logs/"):
-        try:
-            page.goto(BASE_URL + path, wait_until="domcontentloaded", timeout=15_000)
-            page.wait_for_load_state("networkidle", timeout=10_000)
-            if "/login" not in page.url:
-                log(f"Direct nav to {path} worked. URL: {page.url}")
-                screenshot(page, "care-logs")
-                dump_html(page, "care-logs")
-                return
-        except Exception:
-            continue
-
-    log("Could not find a care-log page; will parse the dashboard instead.")
-    screenshot(page, "care-logs-fallback")
-    dump_html(page, "care-logs-fallback")
+            break
+    log(f"Finished loading updates ({clicks} pagination clicks)")
 
 
 def parse_entries(page, since: datetime) -> list[dict]:
-    """Try to extract structured care log entries.
+    """Extract update entries from the dashboard.
 
-    Returns a list of dicts.  Best case: {name, date, text}.
-    Fallback: {raw}.
+    Each update card on the ClearCare dashboard has a caregiver name,
+    date, and log text.  We try several selector strategies, then dump
+    the HTML for offline analysis regardless.
     """
+    dump_html(page, "dashboard")
+
     entries: list[dict] = []
 
-    # Try common ClearCare selectors for individual entries
+    # Strategy: look for common container selectors
     for sel in (
-        ".log-entry",
-        ".care-log-entry",
-        ".daily-log-entry",
-        ".activity-entry",
-        "[class*='logEntry']",
-        "[class*='careLog']",
-        "[class*='note-entry']",
-        ".entry",
+        ".update-entry",
+        ".activity-update",
+        ".dashboard-update",
+        "[class*='update']",
+        "[class*='Update']",
+        ".feed-item",
+        ".stream-item",
+        "[class*='feed']",
+        "[class*='stream']",
     ):
         items = page.query_selector_all(sel)
         if items:
@@ -189,7 +162,8 @@ def scrape_care_logs(email: str, password: str, since: datetime) -> list[dict]:
         page = context.new_page()
         try:
             do_login(page, email, password)
-            navigate_to_care_logs(page)
+            load_all_updates(page)
+            screenshot(page, "all-updates-loaded")
             return parse_entries(page, since)
         except Exception:
             try:
