@@ -1,9 +1,13 @@
 # Starlight daily digest
 
-Logs in to the Starlight Caregivers family room each morning, scrapes the
-dashboard, and emails the contents to a configured recipient list.
+Logs in to the Starlight Caregivers (ClearCare / WellSky) family room each
+morning, scrapes care log entries from the dashboard feed, and emails a
+structured digest — caregiver name, date, and log text — to a configured
+recipient list.
 
-Runs as a scheduled GitHub Actions job.
+Only entries posted since the last successful run are included.
+
+Runs as a scheduled GitHub Actions job at 3:12 AM PT daily.
 
 ## One-time setup
 
@@ -38,13 +42,15 @@ Add all five:
 
 Repo → Actions tab → "Daily Starlight digest" → "Run workflow".
 
-This triggers a manual run. The scraper still does its random jitter sleep, so
-the run will take up to an hour unless you set `SKIP_JITTER=1` (which you can
-add as a temporary repo variable, or test locally instead — see below).
+The workflow accepts two optional inputs for testing:
 
-If anything fails, the job uploads `artifacts/failure.png` so you can see what
-the browser was looking at when it broke. Failure also sends an email with the
-traceback.
+- **test_email** — override `EMAIL_TO` (e.g. `dfreeman@gmail.com`)
+- **since_override** — ISO-8601 timestamp to override the default "since last
+  successful run" window (e.g. `2026-05-10T00:00:00Z`)
+
+If anything fails, the job uploads screenshots and an HTML dump of the page
+as artifacts so you can see what the browser was looking at when it broke.
+Failure also sends an email with the traceback.
 
 ## Running locally
 
@@ -57,11 +63,22 @@ export PORTAL_EMAIL='...'
 export PORTAL_PASSWORD='...'
 export GMAIL_USER='...'
 export GMAIL_APP_PASSWORD='...'
-export EMAIL_TO='dfreeman@gmail.com,laura.f.gordon@gmail.com'
-export SKIP_JITTER=1
+export EMAIL_TO='dfreeman@gmail.com'
+export SINCE='2026-05-10T00:00:00Z'
 
 python scraper.py
 ```
+
+## How it works
+
+1. Logs in to the ClearCare family-room portal via Playwright (headless
+   Chromium).
+2. Clicks "Load More Updates" on the dashboard to paginate all entries.
+3. Parses each `article.postWrap` element from the Angular feed — extracts
+   the caregiver name, date, and log text.
+4. Filters out entries older than the `SINCE` timestamp (defaults to the
+   last successful GitHub Actions run).
+5. Emails the structured digest from "Starlight Digest Bot".
 
 ## Updating the selectors
 
@@ -74,18 +91,18 @@ python -m playwright codegen https://starlightcaregivers.clearcareonline.com/fam
 
 Do the login by hand in the recorder window. Codegen will print Python with the
 exact selectors it observed; paste the relevant `page.fill(...)` and
-`page.click(...)` lines into `scrape_dashboard()`.
+`page.click(...)` lines into `do_login()`.
 
-## Notes on the schedule
+The dashboard feed entries use these selectors:
 
-GitHub Actions cron is UTC-only and does not follow DST. `0 10 * * *` means:
+- `article.postWrap` — entry container (`ng-repeat="entry in feedEntries"`)
+- `h3.userName` — posted-by name
+- `span.timeStamp` — date (e.g. "Sun May 17, 2026")
+- `div[ng-show*="model_type=='message'"] p.postMsg` — log text
 
-- 3:00 AM PDT (mid-March to early November) — script jitters to 3:00–4:00 AM
-- 2:00 AM PST (rest of the year) — script jitters to 2:00–3:00 AM
+## Schedule
 
-If you'd rather hold the PST window steady at 3–4 AM, change the cron to
-`0 11 * * *` and accept that PDT runs become 4–5 AM. There is no way to get
-both halves of the year into the same PT clock window with a single cron.
+The cron runs at `12 10 * * *` (10:12 UTC), which is:
 
-GitHub also notes that scheduled jobs may be delayed by a few minutes during
-heavy load, so don't pick a time where precision matters.
+- **3:12 AM PDT** (mid-March to early November)
+- **2:12 AM PST** (rest of the year)
